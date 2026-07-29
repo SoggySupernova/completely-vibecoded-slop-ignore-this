@@ -1,11 +1,14 @@
 mod central;
 mod gatt_ids;
 mod mesh;
+mod peer_registry;
 mod peripheral;
 mod protocol;
 
 use clap::Parser;
 use mesh::{Mesh, UiEvent};
+use peer_registry::PeerRegistry;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[derive(Parser, Debug)]
@@ -33,12 +36,10 @@ async fn main() -> bluer::Result<()> {
     let session = bluer::Session::new().await?;
     let adapter = session.default_adapter().await?;
     adapter.set_powered(true).await?;
-    println!(
-        "Using adapter {} ({})",
-        adapter.name(),
-        adapter.address().await?
-    );
+    let our_addr = adapter.address().await?;
+    println!("Using adapter {} ({})", adapter.name(), our_addr);
 
+    let registry = Arc::new(PeerRegistry::new(our_addr));
     let (mesh, mut ui_rx) = Mesh::new(nickname.clone());
 
     // UI printer task: prints incoming chat messages and link-count changes.
@@ -58,9 +59,16 @@ async fn main() -> bluer::Result<()> {
     // Peripheral role: advertise + serve GATT so others can connect to us.
     let peripheral_adapter = adapter.clone();
     let peripheral_mesh = mesh.clone();
+    let peripheral_registry = registry.clone();
     let peripheral_name = format!("blemesh-{}", nickname);
     tokio::spawn(async move {
-        if let Err(e) = peripheral::run(peripheral_adapter, peripheral_mesh, peripheral_name).await
+        if let Err(e) = peripheral::run(
+            peripheral_adapter,
+            peripheral_mesh,
+            peripheral_registry,
+            peripheral_name,
+        )
+        .await
         {
             eprintln!("peripheral role stopped: {e}");
         }
@@ -69,8 +77,9 @@ async fn main() -> bluer::Result<()> {
     // Central role: scan + connect to other nodes' peripheral side.
     let central_adapter = adapter.clone();
     let central_mesh = mesh.clone();
+    let central_registry = registry.clone();
     tokio::spawn(async move {
-        if let Err(e) = central::run(central_adapter, central_mesh).await {
+        if let Err(e) = central::run(central_adapter, central_mesh, central_registry).await {
             eprintln!("central role stopped: {e}");
         }
     });

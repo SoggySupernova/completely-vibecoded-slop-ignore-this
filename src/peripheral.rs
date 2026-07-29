@@ -4,6 +4,7 @@
 
 use crate::gatt_ids::{CHAT_CHAR_UUID, SERVICE_UUID};
 use crate::mesh::Mesh;
+use crate::peer_registry::PeerRegistry;
 use bluer::adv::Advertisement;
 use bluer::gatt::local::{
     characteristic_control, Application, Characteristic, CharacteristicControlEvent,
@@ -23,7 +24,12 @@ struct PeerConn {
     link_id: Option<crate::mesh::LinkId>,
 }
 
-pub async fn run(adapter: Adapter, mesh: Arc<Mesh>, local_name: String) -> bluer::Result<()> {
+pub async fn run(
+    adapter: Adapter,
+    mesh: Arc<Mesh>,
+    registry: Arc<PeerRegistry>,
+    local_name: String,
+) -> bluer::Result<()> {
     let le_advertisement = Advertisement {
         service_uuids: vec![SERVICE_UUID].into_iter().collect(),
         discoverable: Some(true),
@@ -71,13 +77,13 @@ pub async fn run(adapter: Adapter, mesh: Arc<Mesh>, local_name: String) -> bluer
                     Ok(r) => r,
                     Err(_) => continue,
                 };
-                let link_id = ensure_link(&mesh, &mut peers, addr).await;
-                spawn_reader_task(mesh.clone(), link_id, reader);
+                let link_id = ensure_link(&mesh, &registry, &mut peers, addr).await;
+                spawn_reader_task(mesh.clone(), registry.clone(), addr, link_id, reader);
             }
             Some(CharacteristicControlEvent::Notify(writer)) => {
                 let addr = writer.device_address();
-                let link_id = ensure_link(&mesh, &mut peers, addr).await;
-                spawn_writer_task(mesh.clone(), link_id, writer);
+                let link_id = ensure_link(&mesh, &registry, &mut peers, addr).await;
+                spawn_writer_task(mesh.clone(), registry.clone(), addr, link_id, writer);
             }
             None => break,
         }
@@ -90,6 +96,7 @@ pub async fn run(adapter: Adapter, mesh: Arc<Mesh>, local_name: String) -> bluer
 /// time we see this address (via either a Write or Notify event).
 async fn ensure_link(
     mesh: &Arc<Mesh>,
+    registry: &Arc<PeerRegistry>,
     peers: &mut HashMap<Address, PeerConn>,
     addr: Address,
 ) -> crate::mesh::LinkId {
@@ -98,8 +105,20 @@ async fn ensure_link(
             return id;
         }
     }
+    // This should normally succeed: by the tie-break rule in
+    // peer_registry.rs, only peers with a *lower* address should ever be
+    // dialing in to us. If claim() unexpectedly fails here it means our
+    // own central role already opened an outgoing link to this same
+    // address -- log it since it indicates the tie-break didn't hold
+    // (e.g. both sides raced before either had discovered the other).
+    if !registry.claim(addr).await {
+        eprintln!(
+            "[peripheral] warning: {addr} connected to us but we already have an active link to it"
+        );
+    }
     let handle = mesh.register_link().await;
     let id = handle.id;
+    println!("[peripheral] link established with {addr} (link {id})");
     peers.insert(addr, PeerConn { link_id: Some(id) });
     // Stash the outgoing receiver under this LinkId. It's picked up by
     // spawn_writer_task once the Notify event arrives for this device (the
@@ -145,21 +164,38 @@ mod once_stash {
     }
 }
 
-fn spawn_reader_task(mesh: Arc<Mesh>, link_id: crate::mesh::LinkId, mut reader: CharacteristicReader) {
+fn spawn_reader_task(
+    mesh: Arc<Mesh>,
+    registry: Arc<PeerRegistry>,
+    addr: Address,
+    link_id: crate::mesh::LinkId,
+    mut reader: CharacteristicReader,
+) {
     tokio::spawn(async move {
         let mut buf = vec![0u8; 512];
         loop {
             match reader.read(&mut buf).await {
                 Ok(0) => break, // stream closed
                 Ok(n) => mesh.handle_incoming(link_id, &buf[..n]).await,
-                Err(_) => break,
+                Err(e) => {
+                    eprintln!("[peripheral] read error on link {link_id} ({addr}): {e}");
+                    break;
+                }
             }
         }
+        println!("[peripheral] read side of link {link_id} ({addr}) closed");
         mesh.unregister_link(link_id).await;
+        registry.release(addr).await;
     });
 }
 
-fn spawn_writer_task(mesh: Arc<Mesh>, link_id: crate::mesh::LinkId, mut writer: CharacteristicWriter) {
+fn spawn_writer_task(
+    mesh: Arc<Mesh>,
+    registry: Arc<PeerRegistry>,
+    addr: Address,
+    link_id: crate::mesh::LinkId,
+    mut writer: CharacteristicWriter,
+) {
     tokio::spawn(async move {
         let mut rx = match STASH.take(link_id).await {
             Some(rx) => rx,
@@ -167,10 +203,13 @@ fn spawn_writer_task(mesh: Arc<Mesh>, link_id: crate::mesh::LinkId, mut writer: 
         };
         use tokio::io::AsyncWriteExt;
         while let Some(data) = rx.recv().await {
-            if writer.write_all(&data).await.is_err() {
+            if let Err(e) = writer.write_all(&data).await {
+                eprintln!("[peripheral] write error on link {link_id} ({addr}): {e}");
                 break;
             }
         }
+        println!("[peripheral] write side of link {link_id} ({addr}) closed");
         mesh.unregister_link(link_id).await;
+        registry.release(addr).await;
     });
 }

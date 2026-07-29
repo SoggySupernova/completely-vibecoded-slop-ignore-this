@@ -57,6 +57,23 @@ message on one, and it should appear on the other within a couple of
 seconds — the time it takes BlueZ to discover, connect, and negotiate
 the GATT link.
 
+## Why two nodes were racing each other
+
+Early testing between two machines surfaced flaky, non-deterministic
+errors: `ATT error 0x0e`, `"GATT services have not been resolved"`, and
+links that dropped the instant a message was sent. Root cause: a BLE
+radio can only hold **one** physical connection per peer address, but the
+central and peripheral roles didn't know about each other — so both
+nodes' central roles would try to dial out to each other at the same
+time, and the two connection attempts collided on the radio.
+
+Fix (`src/peer_registry.rs`): a deterministic tie-break — whichever node
+has the lower Bluetooth address is the only one that ever dials out for
+that pair; the other stays passive and simply accepts the incoming
+connection on its peripheral side. Since each link already carries both
+directions of traffic (write + notify on the same characteristic), one
+physical connection per pair is all that's needed.
+
 ## Known limitations (deliberate, for v1)
 
 - **No encryption.** Anyone in range can read every message. This was an
@@ -83,5 +100,6 @@ src/
   protocol.rs     packet wire format (encode/decode)
   peripheral.rs   BLE peripheral role (GATT server + advertising)
   central.rs      BLE central role (scan + connect + GATT client)
+  peer_registry.rs address tie-break to prevent duplicate connections
   gatt_ids.rs     shared service/characteristic UUIDs
 ```
