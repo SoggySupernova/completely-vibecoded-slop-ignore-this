@@ -95,10 +95,11 @@ async fn connect_retry_loop(adapter: Adapter, addr: Address, mesh: Arc<Mesh>, re
             }
         };
 
+        let mut give_up = false;
         match try_bridge_device(&device, addr, mesh.clone()).await {
             Ok(BridgeOutcome::NotAPeer) => {
                 registry.release(addr).await;
-                return; // don't keep retrying something that isn't ours
+                give_up = true;
             }
             Ok(BridgeOutcome::LinkClosed) => {
                 println!("[central] link with {addr} closed normally, will retry in {RETRY_BACKOFF:?}");
@@ -108,6 +109,26 @@ async fn connect_retry_loop(adapter: Adapter, addr: Address, mesh: Arc<Mesh>, re
                 eprintln!("[central] connection to {addr} failed: {e}, will retry in {RETRY_BACKOFF:?}");
                 registry.release(addr).await;
             }
+        }
+
+        // Force a clean slate before retrying (or giving up). This
+        // matters especially after a timeout: our client-side timeout
+        // only stops us waiting, it doesn't cancel the underlying D-Bus
+        // call, so an AcquireWrite / AcquireNotify can still complete on
+        // BlueZ's side after we've given up on it. Left alone, that
+        // orphans an acquired GATT resource that the next attempt then
+        // collides with ("already acquired" / "not permitted").
+        // Disconnecting forces BlueZ to release everything tied to this
+        // connection regardless of what state our side thinks it's in.
+        if device.is_connected().await.unwrap_or(false) {
+            println!("[central] disconnecting {addr} to clear any GATT state");
+            if let Err(e) = device.disconnect().await {
+                eprintln!("[central] disconnect of {addr} failed: {e}");
+            }
+        }
+
+        if give_up {
+            return; // don't keep retrying something that isn't one of our peers
         }
 
         tokio::time::sleep(RETRY_BACKOFF).await;

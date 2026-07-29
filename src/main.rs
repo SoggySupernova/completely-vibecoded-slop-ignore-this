@@ -34,6 +34,23 @@ async fn main() -> bluer::Result<()> {
     println!();
 
     let session = bluer::Session::new().await?;
+
+    // Register a permissive agent so BlueZ auto-accepts pairing/service
+    // authorization instead of falling back to the desktop's interactive
+    // agent (which is what causes that brief "access request" popup, and
+    // which fails the connection if nobody clicks it fast enough). All
+    // handlers left as None -> NoInputNoOutput capability, accepts
+    // everything. We don't want bonding/pairing at all for this app, so
+    // this is the appropriate choice, not a security shortcut we're
+    // taking reluctantly.
+    let _agent_handle = session
+        .register_agent(bluer::agent::Agent {
+            request_default: true,
+            ..Default::default()
+        })
+        .await?;
+    println!("Registered permissive pairing agent (no bonding/encryption used)");
+
     let adapter = session.default_adapter().await?;
     adapter.set_powered(true).await?;
     let our_addr = adapter.address().await?;

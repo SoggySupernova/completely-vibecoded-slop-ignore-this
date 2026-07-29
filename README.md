@@ -74,6 +74,38 @@ connection on its peripheral side. Since each link already carries both
 directions of traffic (write + notify on the same characteristic), one
 physical connection per pair is all that's needed.
 
+## Troubleshooting: "Notify acquired" / "not permitted" on retry
+
+This was a real bug introduced by the timeout wrapping described above:
+`tokio::time::timeout()` only makes *our* code stop waiting on a D-Bus
+call, it doesn't cancel the call itself. If `AcquireNotify` (or
+`AcquireWrite`) was just slow rather than genuinely stuck, it can still
+succeed on BlueZ's side after we've already given up and moved on to a
+retry. That leaves a real, acquired GATT resource on that characteristic
+that nothing ever releases (since the `CharacteristicWriter`/`Reader` we
+would've dropped to trigger cleanup never made it back to us) — so the
+next attempt collides with "already acquired: not permitted".
+
+Fixed by forcing a full `device.disconnect()` after every attempt —
+success, failure, or "not a peer" — before retrying or giving up.
+Disconnecting tears down the whole ACL connection, which forces BlueZ to
+release any Acquire'd write/notify sessions regardless of what state our
+side thinks they're in, guaranteeing a clean slate for the next attempt.
+
+## Troubleshooting: a brief "access request" popup on the peer, then failure
+
+This is BlueZ asking a *desktop* pairing agent (GNOME's bluetooth applet,
+etc.) to authorize the connection/service — and since nobody clicks it in
+the split second it's shown, BlueZ treats it as denied and the connect
+attempt fails or hangs until timeout. This app now registers its own
+agent (`bluer::agent::Agent` with `request_default: true` and every
+handler left as default) right at startup, which makes BlueZ route these
+requests to *us* instead, and — since the whole point of this app is "no
+encryption, no bonding" — we accept everything automatically rather than
+prompting. You should no longer see any popup at all; if you still do,
+something else on the system (e.g. a second registered agent with higher
+priority) may be intercepting the request first.
+
 ## Troubleshooting: D-Bus timeouts on connect
 
 If you see `internal error: D-Bus error org.freedesktop.DBus.Error.Timeout`
