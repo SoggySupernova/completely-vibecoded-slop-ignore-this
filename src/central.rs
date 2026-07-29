@@ -8,37 +8,64 @@
 //! addresses at a time. We use `PeerRegistry::we_should_initiate` so that,
 //! for any given pair of nodes, only one side ever dials out -- see
 //! peer_registry.rs for why this matters.
+//!
+//! Every BlueZ D-Bus call we make (Connect, resolving services, acquiring
+//! the write/notify IO) is wrapped in a timeout. Without this, a wedged
+//! D-Bus call or an out-of-range/uncooperative peer can hang a connection
+//! attempt indefinitely with no useful diagnostic beyond "Timeout waiting
+//! for reply" -- wrapping it ourselves gives a clear, per-stage error and
+//! lets us retry instead of leaving the task stuck forever.
 
 use crate::gatt_ids::{CHAT_CHAR_UUID, SERVICE_UUID};
 use crate::mesh::Mesh;
 use crate::peer_registry::PeerRegistry;
-use bluer::{Adapter, Address, AdapterEvent, Device};
+use bluer::{Adapter, Address, AdapterEvent, Device, Error, ErrorKind};
 use futures::{pin_mut, StreamExt};
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::timeout;
+
+/// How long we'll wait on any single BlueZ D-Bus call before giving up on
+/// this connection attempt and retrying later.
+const OP_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// How long to wait before retrying a device we failed to bridge, or
+/// reconnecting one whose link closed normally.
+const RETRY_BACKOFF: Duration = Duration::from_secs(5);
+
+enum BridgeOutcome {
+    /// Device doesn't advertise our service; not a peer, stop retrying it.
+    NotAPeer,
+    /// We had a working link and it closed (peer went away, etc).
+    LinkClosed,
+}
 
 pub async fn run(adapter: Adapter, mesh: Arc<Mesh>, registry: Arc<PeerRegistry>) -> bluer::Result<()> {
+    // Addresses we've already spawned a persistent retry-loop task for.
+    // (Separate from the registry's "active link" claim -- this just
+    // prevents spawning a second retry loop for the same address.)
+    let mut loop_spawned: HashSet<Address> = HashSet::new();
+
     let discover = adapter.discover_devices().await?;
     pin_mut!(discover);
 
     while let Some(evt) = discover.next().await {
         if let AdapterEvent::DeviceAdded(addr) = evt {
             if !registry.we_should_initiate(addr) {
-                // The peer's address wins the tie-break; it's responsible
-                // for connecting to us instead. Don't even look at it.
+                // The peer's address wins the tie-break; it connects to us.
                 continue;
             }
-            let device = match adapter.device(addr) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
+            if !loop_spawned.insert(addr) {
+                continue; // already have a retry loop running for this address
+            }
+            println!("[central] discovered {addr}, we will initiate (address tie-break)");
+            let adapter = adapter.clone();
             let mesh = mesh.clone();
             let registry = registry.clone();
             tokio::spawn(async move {
-                if let Err(e) = try_bridge_device(device, addr, mesh, registry.clone()).await {
-                    eprintln!("[central] connection to {addr} failed: {e}");
-                    registry.release(addr).await;
-                }
+                connect_retry_loop(adapter, addr, mesh, registry).await;
             });
         }
     }
@@ -46,30 +73,75 @@ pub async fn run(adapter: Adapter, mesh: Arc<Mesh>, registry: Arc<PeerRegistry>)
     Ok(())
 }
 
-async fn try_bridge_device(
-    device: Device,
-    addr: Address,
-    mesh: Arc<Mesh>,
-    registry: Arc<PeerRegistry>,
-) -> bluer::Result<()> {
+/// Keeps trying to bridge `addr` into the mesh, with backoff, until it
+/// turns out not to be one of our peers at all.
+async fn connect_retry_loop(adapter: Adapter, addr: Address, mesh: Arc<Mesh>, registry: Arc<PeerRegistry>) {
+    loop {
+        if !registry.claim(addr).await {
+            // Peripheral side already has (or is establishing) a link to
+            // this address -- nothing for us to do right now.
+            println!("[central] {addr} already linked via peripheral side, will re-check later");
+            tokio::time::sleep(RETRY_BACKOFF).await;
+            continue;
+        }
+
+        let device = match adapter.device(addr) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[central] couldn't get device handle for {addr}: {e}");
+                registry.release(addr).await;
+                tokio::time::sleep(RETRY_BACKOFF).await;
+                continue;
+            }
+        };
+
+        match try_bridge_device(&device, addr, mesh.clone()).await {
+            Ok(BridgeOutcome::NotAPeer) => {
+                registry.release(addr).await;
+                return; // don't keep retrying something that isn't ours
+            }
+            Ok(BridgeOutcome::LinkClosed) => {
+                println!("[central] link with {addr} closed normally, will retry in {RETRY_BACKOFF:?}");
+                registry.release(addr).await;
+            }
+            Err(e) => {
+                eprintln!("[central] connection to {addr} failed: {e}, will retry in {RETRY_BACKOFF:?}");
+                registry.release(addr).await;
+            }
+        }
+
+        tokio::time::sleep(RETRY_BACKOFF).await;
+    }
+}
+
+fn timeout_err(stage: &str) -> Error {
+    Error {
+        kind: ErrorKind::Failed,
+        message: format!("timed out after {OP_TIMEOUT:?} waiting for {stage}"),
+    }
+}
+
+async fn try_bridge_device(device: &Device, addr: Address, mesh: Arc<Mesh>) -> bluer::Result<BridgeOutcome> {
     let uuids = device.uuids().await?.unwrap_or_default();
     if !uuids.contains(&SERVICE_UUID) {
-        return Ok(());
+        return Ok(BridgeOutcome::NotAPeer);
     }
-
-    // Claim this address before touching the radio. If something else
-    // (a duplicate DeviceAdded event, or the peripheral side) already has
-    // an active link to this address, back off instead of racing it.
-    if !registry.claim(addr).await {
-        return Ok(());
-    }
+    println!("[central] {addr} advertises our service");
 
     if !device.is_connected().await? {
-        device.connect().await?;
+        println!("[central] {addr} connecting...");
+        timeout(OP_TIMEOUT, device.connect())
+            .await
+            .map_err(|_| timeout_err("Connect()"))??;
     }
+    println!("[central] {addr} connected, resolving GATT services...");
+
+    let services = timeout(OP_TIMEOUT, device.services())
+        .await
+        .map_err(|_| timeout_err("service resolution"))??;
 
     let mut target_char = None;
-    for service in device.services().await? {
+    for service in services {
         if service.uuid().await? == SERVICE_UUID {
             for ch in service.characteristics().await? {
                 if ch.uuid().await? == CHAT_CHAR_UUID {
@@ -79,19 +151,29 @@ async fn try_bridge_device(
         }
     }
     let characteristic = match target_char {
-        Some(c) => c,
+        Some(c) => {
+            println!("[central] {addr} found chat characteristic");
+            c
+        }
         None => {
-            registry.release(addr).await;
-            return Ok(());
+            eprintln!("[central] {addr} advertised our service but characteristic wasn't found");
+            return Ok(BridgeOutcome::NotAPeer);
         }
     };
 
-    let write_io = characteristic.write_io().await?;
-    let notify_io = characteristic.notify_io().await?;
+    let write_io = timeout(OP_TIMEOUT, characteristic.write_io())
+        .await
+        .map_err(|_| timeout_err("write_io()"))??;
+    println!("[central] {addr} write IO ready (mtu={})", write_io.mtu());
+
+    let notify_io = timeout(OP_TIMEOUT, characteristic.notify_io())
+        .await
+        .map_err(|_| timeout_err("notify_io()"))??;
+    println!("[central] {addr} notify IO ready (mtu={})", notify_io.mtu());
 
     let handle = mesh.register_link().await;
     let link_id = handle.id;
-    println!("[central] link established with {addr} (link {link_id})");
+    println!("[central] {addr} mesh link {link_id} established");
 
     // Reader task: notifications from the peer -> mesh.
     let mesh_r = mesh.clone();
@@ -100,10 +182,13 @@ async fn try_bridge_device(
         let mut buf = vec![0u8; 512];
         loop {
             match notify_io.read(&mut buf).await {
-                Ok(0) => break,
+                Ok(0) => {
+                    println!("[central] {addr} notify stream ended (link {link_id})");
+                    break;
+                }
                 Ok(n) => mesh_r.handle_incoming(link_id, &buf[..n]).await,
                 Err(e) => {
-                    eprintln!("[central] notify read error on link {link_id}: {e}");
+                    eprintln!("[central] {addr} notify read error on link {link_id}: {e}");
                     break;
                 }
             }
@@ -116,7 +201,7 @@ async fn try_bridge_device(
     let writer_task = tokio::spawn(async move {
         while let Some(data) = outgoing_rx.recv().await {
             if let Err(e) = write_io.write_all(&data).await {
-                eprintln!("[central] write error on link {link_id}: {e}");
+                eprintln!("[central] {addr} write error on link {link_id}: {e}");
                 break;
             }
         }
@@ -127,7 +212,6 @@ async fn try_bridge_device(
 
     println!("[central] link with {addr} (link {link_id}) closed");
     mesh.unregister_link(link_id).await;
-    registry.release(addr).await;
 
-    Ok(())
+    Ok(BridgeOutcome::LinkClosed)
 }

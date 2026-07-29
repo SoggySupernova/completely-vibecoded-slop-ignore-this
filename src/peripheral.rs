@@ -37,6 +37,10 @@ pub async fn run(
         ..Default::default()
     };
     let _adv_handle = adapter.advertise(le_advertisement).await?;
+    println!(
+        "[peripheral] advertising service {SERVICE_UUID} on adapter {}",
+        adapter.name()
+    );
 
     let (char_control, char_handle) = characteristic_control();
     let app = Application {
@@ -63,6 +67,7 @@ pub async fn run(
         ..Default::default()
     };
     let _app_handle = adapter.serve_gatt_application(app).await?;
+    println!("[peripheral] GATT server registered, waiting for connections...");
 
     // Keep the advertisement/app handles alive for the lifetime of this
     // task by holding them in scope until the loop below exits.
@@ -73,15 +78,21 @@ pub async fn run(
         match char_control.next().await {
             Some(CharacteristicControlEvent::Write(req)) => {
                 let addr = req.device_address();
+                let mtu = req.mtu();
                 let reader = match req.accept() {
                     Ok(r) => r,
-                    Err(_) => continue,
+                    Err(e) => {
+                        eprintln!("[peripheral] failed to accept write from {addr}: {e}");
+                        continue;
+                    }
                 };
+                println!("[peripheral] {addr} write IO accepted (mtu={mtu})");
                 let link_id = ensure_link(&mesh, &registry, &mut peers, addr).await;
                 spawn_reader_task(mesh.clone(), registry.clone(), addr, link_id, reader);
             }
             Some(CharacteristicControlEvent::Notify(writer)) => {
                 let addr = writer.device_address();
+                println!("[peripheral] {addr} notify IO ready (mtu={})", writer.mtu());
                 let link_id = ensure_link(&mesh, &registry, &mut peers, addr).await;
                 spawn_writer_task(mesh.clone(), registry.clone(), addr, link_id, writer);
             }

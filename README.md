@@ -74,6 +74,38 @@ connection on its peripheral side. Since each link already carries both
 directions of traffic (write + notify on the same characteristic), one
 physical connection per pair is all that's needed.
 
+## Troubleshooting: D-Bus timeouts on connect
+
+If you see `internal error: D-Bus error org.freedesktop.DBus.Error.Timeout`
+on a connection attempt, that's `bluetoothd` itself not responding to a
+method call (Connect, service resolution, or acquiring the write/notify
+IO) within a reasonable time — not a BLE-level rejection. Common causes,
+roughly in order of likelihood:
+
+- **The peer is out of range or the signal is marginal.** LE connection
+  establishment retries at the link layer before giving up; weak signal
+  makes this slow and eventually times out.
+- **The adapter is being asked to scan and connect at the same time.**
+  Some controllers/firmware handle concurrent central-scan +
+  connection-establishment poorly. If this happens consistently even at
+  close range, try testing with discovery paused (temporarily comment out
+  the central role) to see if connects become reliable — that would
+  confirm this is your adapter's limitation rather than the app's logic.
+- **A stale device object.** If BlueZ still has a cached, unreachable
+  device entry, `bluetoothd` may hang trying to reconnect to it. Running
+  `bluetoothctl remove <addr>` and letting discovery re-add it fresh can
+  help.
+
+The app now wraps every BlueZ call (`Connect`, service resolution,
+`write_io`/`notify_io`) in a 12-second timeout and retries with a 5-second
+backoff indefinitely (as long as the device keeps advertising our
+service), instead of hanging on a single stuck call. Every stage also
+logs on success now, not just failure — you should see a line for each
+step (`connecting...`, `connected, resolving GATT services...`, `found
+chat characteristic`, `write IO ready (mtu=...)`, `mesh link N
+established`, etc.) so it's obvious exactly where a given attempt is
+getting stuck.
+
 ## Known limitations (deliberate, for v1)
 
 - **No encryption.** Anyone in range can read every message. This was an
