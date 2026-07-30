@@ -15,6 +15,13 @@
 //! attempt indefinitely with no useful diagnostic beyond "Timeout waiting
 //! for reply" -- wrapping it ourselves gives a clear, per-stage error and
 //! lets us retry instead of leaving the task stuck forever.
+//!
+//! We also pause active scanning while establishing a connection (see
+//! PeerRegistry::pause_scanning). On real hardware, a single radio trying
+//! to scan and set up a brand-new connection at the same time can drop
+//! that connection in its first fraction of a second, before any GATT
+//! traffic happens at all -- which is exactly the failure mode this was
+//! added to fix.
 
 use crate::gatt_ids::{CHAT_CHAR_UUID, SERVICE_UUID};
 use crate::mesh::Mesh;
@@ -35,42 +42,65 @@ const OP_TIMEOUT: Duration = Duration::from_secs(12);
 /// reconnecting one whose link closed normally.
 const RETRY_BACKOFF: Duration = Duration::from_secs(5);
 
-enum BridgeOutcome {
-    /// Device doesn't advertise our service; not a peer, stop retrying it.
-    NotAPeer,
-    /// We had a working link and it closed (peer went away, etc).
-    LinkClosed,
-}
-
 pub async fn run(adapter: Adapter, mesh: Arc<Mesh>, registry: Arc<PeerRegistry>) -> bluer::Result<()> {
     // Addresses we've already spawned a persistent retry-loop task for.
     // (Separate from the registry's "active link" claim -- this just
     // prevents spawning a second retry loop for the same address.)
     let mut loop_spawned: HashSet<Address> = HashSet::new();
+    let mut scan_allowed = registry.subscribe_scan_allowed();
 
-    let discover = adapter.discover_devices().await?;
-    pin_mut!(discover);
+    loop {
+        // Don't even start a scan session while a connection attempt has
+        // asked for quiet radio time.
+        while !*scan_allowed.borrow() {
+            println!("[central] scanning paused (a connection is being established)");
+            if scan_allowed.changed().await.is_err() {
+                return Ok(());
+            }
+        }
 
-    while let Some(evt) = discover.next().await {
-        if let AdapterEvent::DeviceAdded(addr) = evt {
-            if !registry.we_should_initiate(addr) {
-                // The peer's address wins the tie-break; it connects to us.
-                continue;
+        println!("[central] scanning for peers...");
+        let discover = adapter.discover_devices().await?;
+        pin_mut!(discover);
+
+        // Inner loop: discover devices until told to pause, at which
+        // point we drop `discover` (ending this scan session) and go back
+        // to the outer loop to wait for scanning to be allowed again.
+        loop {
+            tokio::select! {
+                changed = scan_allowed.changed() => {
+                    if changed.is_err() {
+                        return Ok(());
+                    }
+                    if !*scan_allowed.borrow() {
+                        break;
+                    }
+                }
+                evt = discover.next() => {
+                    match evt {
+                        Some(AdapterEvent::DeviceAdded(addr)) => {
+                            if !registry.we_should_initiate(addr) {
+                                // The peer's address wins the tie-break; it connects to us.
+                                continue;
+                            }
+                            if !loop_spawned.insert(addr) {
+                                continue; // already have a retry loop running for this address
+                            }
+                            println!("[central] discovered {addr}, we will initiate (address tie-break)");
+                            let adapter = adapter.clone();
+                            let mesh = mesh.clone();
+                            let registry = registry.clone();
+                            tokio::spawn(async move {
+                                connect_retry_loop(adapter, addr, mesh, registry).await;
+                            });
+                        }
+                        Some(_) => {}
+                        None => return Ok(()),
+                    }
+                }
             }
-            if !loop_spawned.insert(addr) {
-                continue; // already have a retry loop running for this address
-            }
-            println!("[central] discovered {addr}, we will initiate (address tie-break)");
-            let adapter = adapter.clone();
-            let mesh = mesh.clone();
-            let registry = registry.clone();
-            tokio::spawn(async move {
-                connect_retry_loop(adapter, addr, mesh, registry).await;
-            });
         }
     }
-
-    Ok(())
 }
 
 /// Keeps trying to bridge `addr` into the mesh, with backoff, until it
@@ -95,13 +125,25 @@ async fn connect_retry_loop(adapter: Adapter, addr: Address, mesh: Arc<Mesh>, re
             }
         };
 
+        // Pause scanning for the connection-establishment window (through
+        // GATT setup); resumed as soon as the link is confirmed up and
+        // handed off to steady-state reader/writer tasks, or immediately
+        // on any failure.
+        registry.pause_scanning().await;
+        let setup_result = establish_link(&device, addr, mesh.clone()).await;
+        registry.resume_scanning().await;
+
         let mut give_up = false;
-        match try_bridge_device(&device, addr, mesh.clone()).await {
-            Ok(BridgeOutcome::NotAPeer) => {
+        match setup_result {
+            Ok(EstablishOutcome::NotAPeer) => {
                 registry.release(addr).await;
                 give_up = true;
             }
-            Ok(BridgeOutcome::LinkClosed) => {
+            Ok(EstablishOutcome::Linked { link_id, reader_task, writer_task }) => {
+                let _ = reader_task.await;
+                let _ = writer_task.await;
+                println!("[central] link with {addr} (link {link_id}) closed");
+                mesh.unregister_link(link_id).await;
                 println!("[central] link with {addr} closed normally, will retry in {RETRY_BACKOFF:?}");
                 registry.release(addr).await;
             }
@@ -142,10 +184,19 @@ fn timeout_err(stage: &str) -> Error {
     }
 }
 
-async fn try_bridge_device(device: &Device, addr: Address, mesh: Arc<Mesh>) -> bluer::Result<BridgeOutcome> {
+enum EstablishOutcome {
+    NotAPeer,
+    Linked {
+        link_id: crate::mesh::LinkId,
+        reader_task: tokio::task::JoinHandle<()>,
+        writer_task: tokio::task::JoinHandle<()>,
+    },
+}
+
+async fn establish_link(device: &Device, addr: Address, mesh: Arc<Mesh>) -> bluer::Result<EstablishOutcome> {
     let uuids = device.uuids().await?.unwrap_or_default();
     if !uuids.contains(&SERVICE_UUID) {
-        return Ok(BridgeOutcome::NotAPeer);
+        return Ok(EstablishOutcome::NotAPeer);
     }
     println!("[central] {addr} advertises our service");
 
@@ -157,9 +208,17 @@ async fn try_bridge_device(device: &Device, addr: Address, mesh: Arc<Mesh>) -> b
     }
     println!("[central] {addr} connected, resolving GATT services...");
 
-    let services = timeout(OP_TIMEOUT, device.services())
-        .await
-        .map_err(|_| timeout_err("service resolution"))??;
+    let services = match timeout(OP_TIMEOUT, device.services()).await {
+        Ok(Ok(services)) => services,
+        Ok(Err(e)) => {
+            let still_connected = device.is_connected().await.unwrap_or(false);
+            eprintln!(
+                "[central] {addr} service resolution failed: {e} (still connected: {still_connected})"
+            );
+            return Err(e);
+        }
+        Err(_) => return Err(timeout_err("service resolution")),
+    };
 
     let mut target_char = None;
     for service in services {
@@ -178,7 +237,7 @@ async fn try_bridge_device(device: &Device, addr: Address, mesh: Arc<Mesh>) -> b
         }
         None => {
             eprintln!("[central] {addr} advertised our service but characteristic wasn't found");
-            return Ok(BridgeOutcome::NotAPeer);
+            return Ok(EstablishOutcome::NotAPeer);
         }
     };
 
@@ -228,11 +287,5 @@ async fn try_bridge_device(device: &Device, addr: Address, mesh: Arc<Mesh>) -> b
         }
     });
 
-    let _ = reader_task.await;
-    let _ = writer_task.await;
-
-    println!("[central] link with {addr} (link {link_id}) closed");
-    mesh.unregister_link(link_id).await;
-
-    Ok(BridgeOutcome::LinkClosed)
+    Ok(EstablishOutcome::Linked { link_id, reader_task, writer_task })
 }

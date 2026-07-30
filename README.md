@@ -74,6 +74,52 @@ connection on its peripheral side. Since each link already carries both
 directions of traffic (write + notify on the same characteristic), one
 physical connection per pair is all that's needed.
 
+## Troubleshooting: connects, then drops before any GATT activity at all
+
+If the central log shows `connected, resolving GATT services...` followed
+immediately by `service resolution failed: ... (still connected: false)`,
+and the peripheral side shows *nothing* (not even a failed write/notify
+attempt), the connection is being torn down at the link layer within a
+fraction of a second of being established — before any application-level
+GATT traffic (even basic service discovery) has a chance to happen.
+
+The most common real-world cause: a single BLE radio trying to actively
+**scan** and hold a **brand-new connection** steady at the same time.
+Many controllers (especially cheaper/older ones) can't do both well — the
+scan window steals radio time the fresh connection needs to complete its
+initial supervision handshake, so it gets dropped almost instantly.
+
+Fix: `PeerRegistry::pause_scanning`/`resume_scanning` (a simple
+reference-counted watch channel) lets the central role fully stop and
+tear down its scan session for the entire duration of establishing a
+connection — see `src/central.rs`'s `connect_retry_loop` and
+`peer_registry.rs`. You should now see `[central] scanning paused (a
+connection is being established)` in the logs around each connect
+attempt.
+
+If connections are *still* dropping instantly even with scanning paused,
+that points at something more fundamental — possibly your adapter can't
+hold a stable connection while simultaneously **advertising** as a
+peripheral (the other half of what this app asks the radio to do at
+once). Use the isolation flags below to test that directly: run one
+machine with `--no-peripheral` (central only, no advertising) and see if
+its outgoing connections become stable. If they do, your adapter likely
+doesn't support simultaneous central+peripheral (multi-role) operation,
+which is a hardware/firmware limitation no amount of application code can
+work around — the practical fix at that point is either a different
+adapter with confirmed multi-role support, or restructuring so each node
+runs only one role at a time (which limits mesh topology options).
+
+```bash
+# Isolate: does this adapter hold a stable outgoing connection when it's
+# not also trying to advertise as a peripheral?
+./blemesh --name Alice --no-peripheral
+
+# Isolate: does this adapter hold a stable incoming connection when it's
+# not also trying to scan?
+./blemesh --name Bob --no-central
+```
+
 ## Troubleshooting: "Notify acquired" / "not permitted" on retry
 
 This was a real bug introduced by the timeout wrapping described above:

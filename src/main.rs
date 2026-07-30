@@ -17,6 +17,17 @@ struct Args {
     /// Display name shown to other nodes. Defaults to a random Guest-#### name.
     #[arg(short, long)]
     name: Option<String>,
+
+    /// Disable the peripheral role (no advertising, no GATT server). Useful
+    /// for isolating whether your adapter can't hold a stable central
+    /// connection while also advertising -- a common hardware/firmware
+    /// limitation on cheaper Bluetooth controllers.
+    #[arg(long)]
+    no_peripheral: bool,
+
+    /// Disable the central role (no scanning, no outgoing connections).
+    #[arg(long)]
+    no_central: bool,
 }
 
 #[tokio::main]
@@ -74,32 +85,40 @@ async fn main() -> bluer::Result<()> {
     });
 
     // Peripheral role: advertise + serve GATT so others can connect to us.
-    let peripheral_adapter = adapter.clone();
-    let peripheral_mesh = mesh.clone();
-    let peripheral_registry = registry.clone();
-    let peripheral_name = format!("blemesh-{}", nickname);
-    tokio::spawn(async move {
-        if let Err(e) = peripheral::run(
-            peripheral_adapter,
-            peripheral_mesh,
-            peripheral_registry,
-            peripheral_name,
-        )
-        .await
-        {
-            eprintln!("peripheral role stopped: {e}");
-        }
-    });
+    if args.no_peripheral {
+        println!("Peripheral role disabled (--no-peripheral): not advertising, no GATT server.");
+    } else {
+        let peripheral_adapter = adapter.clone();
+        let peripheral_mesh = mesh.clone();
+        let peripheral_registry = registry.clone();
+        let peripheral_name = format!("blemesh-{}", nickname);
+        tokio::spawn(async move {
+            if let Err(e) = peripheral::run(
+                peripheral_adapter,
+                peripheral_mesh,
+                peripheral_registry,
+                peripheral_name,
+            )
+            .await
+            {
+                eprintln!("peripheral role stopped: {e}");
+            }
+        });
+    }
 
     // Central role: scan + connect to other nodes' peripheral side.
-    let central_adapter = adapter.clone();
-    let central_mesh = mesh.clone();
-    let central_registry = registry.clone();
-    tokio::spawn(async move {
-        if let Err(e) = central::run(central_adapter, central_mesh, central_registry).await {
-            eprintln!("central role stopped: {e}");
-        }
-    });
+    if args.no_central {
+        println!("Central role disabled (--no-central): not scanning, no outgoing connections.");
+    } else {
+        let central_adapter = adapter.clone();
+        let central_mesh = mesh.clone();
+        let central_registry = registry.clone();
+        tokio::spawn(async move {
+            if let Err(e) = central::run(central_adapter, central_mesh, central_registry).await {
+                eprintln!("central role stopped: {e}");
+            }
+        });
+    }
 
     // Chat input loop: read lines from stdin, flood each as a new message.
     let stdin = BufReader::new(tokio::io::stdin());

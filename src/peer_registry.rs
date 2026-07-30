@@ -15,18 +15,23 @@
 
 use bluer::Address;
 use std::collections::HashSet;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 
 pub struct PeerRegistry {
     our_addr: Address,
     active: Mutex<HashSet<Address>>,
+    scan_pause_count: Mutex<u32>,
+    scan_allowed_tx: watch::Sender<bool>,
 }
 
 impl PeerRegistry {
     pub fn new(our_addr: Address) -> Self {
+        let (scan_allowed_tx, _rx) = watch::channel(true);
         PeerRegistry {
             our_addr,
             active: Mutex::new(HashSet::new()),
+            scan_pause_count: Mutex::new(0),
+            scan_allowed_tx,
         }
     }
 
@@ -46,5 +51,38 @@ impl PeerRegistry {
 
     pub async fn release(&self, peer: Address) {
         self.active.lock().await.remove(&peer);
+    }
+
+    /// Request that active scanning be paused. Reference-counted: nested
+    /// pause/resume calls (e.g. from multiple simultaneous connection
+    /// attempts) are safe -- scanning only resumes once every outstanding
+    /// pause has been released.
+    ///
+    /// This exists because a single BLE radio holding an active scan while
+    /// also trying to establish/maintain a fresh connection is a common
+    /// source of instability on real hardware: the connection can be
+    /// dropped in the first fraction of a second, before any GATT traffic
+    /// even happens, because the scan window steals radio time the new
+    /// connection needs to complete its initial supervision handshake.
+    pub async fn pause_scanning(&self) {
+        let mut count = self.scan_pause_count.lock().await;
+        *count += 1;
+        if *count == 1 {
+            let _ = self.scan_allowed_tx.send(false);
+        }
+    }
+
+    pub async fn resume_scanning(&self) {
+        let mut count = self.scan_pause_count.lock().await;
+        if *count > 0 {
+            *count -= 1;
+        }
+        if *count == 0 {
+            let _ = self.scan_allowed_tx.send(true);
+        }
+    }
+
+    pub fn subscribe_scan_allowed(&self) -> watch::Receiver<bool> {
+        self.scan_allowed_tx.subscribe()
     }
 }
