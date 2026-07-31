@@ -74,6 +74,32 @@ connection on its peripheral side. Since each link already carries both
 directions of traffic (write + notify on the same characteristic), one
 physical connection per pair is all that's needed.
 
+## Root cause, finally: SMP pairing (Numeric Comparison) failing
+
+`btmon` traced this down conclusively: BlueZ's client side automatically
+reads a "Database Hash" attribute (part of the standard GATT service
+every GATT server exposes since BT 5.1's Robust Caching feature — not
+anything this app defines) as a routine part of service discovery. Some
+peers gate that attribute behind encryption, which triggers automatic SMP
+pairing. The peer in this case was requesting **Numeric Comparison**
+pairing — a method that requires a `DisplayYesNo`-capable agent on both
+sides. Our original agent was `NoInputNoOutput` (from leaving every
+handler `None`), which can't complete Numeric Comparison at all, so
+pairing failed and BlueZ tore down the whole connection as an
+authentication failure — matching both the `btmon` trace (`SMP: Pairing
+Failed... Numeric comparison failed`) and `bluetoothctl`'s "Request
+authorization / Request canceled".
+
+Fixed by implementing the agent's handlers explicitly (`request_confirmation`,
+`request_authorization`, `authorize_service`, `request_passkey`,
+`display_passkey`) instead of relying on the "leave everything `None`"
+shortcut, which only gives `NoInputNoOutput`. Each handler just logs and
+auto-accepts — this app has no real bonding/encryption trust model to
+begin with, so blindly accepting is the correct behavior, not a security
+shortcut we're taking reluctantly. This gives BlueZ an agent capable of
+completing whichever pairing method a peer insists on, without ever
+actually prompting anyone.
+
 ## Troubleshooting: connects, then drops before any GATT activity at all
 
 If the central log shows `connected, resolving GATT services...` followed

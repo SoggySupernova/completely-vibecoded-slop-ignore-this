@@ -47,20 +47,61 @@ async fn main() -> bluer::Result<()> {
     let session = bluer::Session::new().await?;
 
     // Register a permissive agent so BlueZ auto-accepts pairing/service
-    // authorization instead of falling back to the desktop's interactive
-    // agent (which is what causes that brief "access request" popup, and
-    // which fails the connection if nobody clicks it fast enough). All
-    // handlers left as None -> NoInputNoOutput capability, accepts
-    // everything. We don't want bonding/pairing at all for this app, so
-    // this is the appropriate choice, not a security shortcut we're
-    // taking reluctantly.
+    // authorization instead of failing or falling back to a desktop's
+    // interactive agent. We explicitly implement every handler (rather
+    // than leaving them all `None`, which only gives a NoInputNoOutput
+    // agent) because some peers insist on Numeric Comparison pairing,
+    // which a NoInputNoOutput agent can't complete at all -- it needs a
+    // Display+YesNo-capable agent, even if that agent (as here) just
+    // blindly accepts without actually displaying/checking anything.
+    // This app has no encryption or bonding trust model to begin with, so
+    // auto-accepting is the correct behavior here, not a shortcut.
     let _agent_handle = session
         .register_agent(bluer::agent::Agent {
             request_default: true,
+            request_confirmation: Some(Box::new(|req| {
+                Box::pin(async move {
+                    println!(
+                        "[agent] auto-confirming passkey {:06} for {}",
+                        req.passkey, req.device
+                    );
+                    Ok(())
+                })
+            })),
+            request_authorization: Some(Box::new(|req| {
+                Box::pin(async move {
+                    println!("[agent] auto-authorizing pairing with {}", req.device);
+                    Ok(())
+                })
+            })),
+            authorize_service: Some(Box::new(|req| {
+                Box::pin(async move {
+                    println!(
+                        "[agent] auto-authorizing service {} for {}",
+                        req.service, req.device
+                    );
+                    Ok(())
+                })
+            })),
+            request_passkey: Some(Box::new(|req| {
+                Box::pin(async move {
+                    println!("[agent] providing dummy passkey for {}", req.device);
+                    Ok(0)
+                })
+            })),
+            display_passkey: Some(Box::new(|req| {
+                Box::pin(async move {
+                    println!(
+                        "[agent] (ignoring) displaying passkey {:06} for {}",
+                        req.passkey, req.device
+                    );
+                    Ok(())
+                })
+            })),
             ..Default::default()
         })
         .await?;
-    println!("Registered permissive pairing agent (no bonding/encryption used)");
+    println!("Registered permissive pairing agent (no real encryption/bonding trust model)");
 
     let adapter = session.default_adapter().await?;
     adapter.set_powered(true).await?;
