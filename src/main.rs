@@ -1,8 +1,8 @@
-mod central;
+mod active;
 mod gatt_ids;
 mod mesh;
 mod peer_registry;
-mod peripheral;
+mod passive;
 mod protocol;
 
 use clap::Parser;
@@ -23,11 +23,11 @@ struct Args {
     /// connection while also advertising -- a common hardware/firmware
     /// limitation on cheaper Bluetooth controllers.
     #[arg(long)]
-    no_peripheral: bool,
+    no_passive: bool,
 
     /// Disable the central role (no scanning, no outgoing connections).
     #[arg(long)]
-    no_central: bool,
+    no_active: bool,
 }
 
 #[tokio::main]
@@ -108,8 +108,14 @@ async fn main() -> bluer::Result<()> {
     let our_addr = adapter.address().await?;
     println!("Using adapter {} ({})", adapter.name(), our_addr);
 
+    // Initialize the registry with ourselves
     let registry = Arc::new(PeerRegistry::new(our_addr));
     let (mesh, mut ui_rx) = Mesh::new(nickname.clone());
+
+
+
+
+    // ===== TASKS =====
 
     // UI printer task: prints incoming chat messages and link-count changes.
     tokio::spawn(async move {
@@ -126,7 +132,7 @@ async fn main() -> bluer::Result<()> {
     });
 
     // Peripheral role: advertise + serve GATT so others can connect to us.
-    if args.no_peripheral {
+    if args.no_passive {
         println!("Peripheral role disabled (--no-peripheral): not advertising, no GATT server.");
     } else {
         let peripheral_adapter = adapter.clone();
@@ -134,7 +140,7 @@ async fn main() -> bluer::Result<()> {
         let peripheral_registry = registry.clone();
         let peripheral_name = format!("blemesh-{}", nickname);
         tokio::spawn(async move {
-            if let Err(e) = peripheral::run(
+            if let Err(e) = passive::run(
                 peripheral_adapter,
                 peripheral_mesh,
                 peripheral_registry,
@@ -148,14 +154,14 @@ async fn main() -> bluer::Result<()> {
     }
 
     // Central role: scan + connect to other nodes' peripheral side.
-    if args.no_central {
+    if args.no_active {
         println!("Central role disabled (--no-central): not scanning, no outgoing connections.");
     } else {
         let central_adapter = adapter.clone();
         let central_mesh = mesh.clone();
         let central_registry = registry.clone();
         tokio::spawn(async move {
-            if let Err(e) = central::run(central_adapter, central_mesh, central_registry).await {
+            if let Err(e) = active::run(central_adapter, central_mesh, central_registry).await {
                 eprintln!("central role stopped: {e}");
             }
         });
